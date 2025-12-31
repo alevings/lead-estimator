@@ -31,6 +31,9 @@ WAITLIST_FORM_URL = "https://tally.so/r/XXXXXXX"  # Replace with your Tally/Type
 # Session timeout (hours)
 SESSION_TIMEOUT_HOURS = 24
 
+# Set to True to see debug info (set False for production)
+DEBUG_MODE = True
+
 
 # =========================================================
 # Authentication Functions
@@ -39,23 +42,25 @@ def get_users_from_secrets() -> dict:
     """
     Load authorized users from Streamlit secrets.
     
-    In .streamlit/secrets.toml, format is:
+    Supports format:
     
     [users]
-    user1 = "hashed_password"
-    user2 = "hashed_password"
-    
-    Or for more detail:
-    
     [users.user1]
+    email = "user@example.com"
     password_hash = "hashed_password"
     name = "John Smith"
     company = "ABC Agency"
     plan = "pro"
     """
     try:
-        return dict(st.secrets.get("users", {}))
-    except Exception:
+        users_section = st.secrets.get("users", {})
+        if DEBUG_MODE:
+            st.sidebar.write("Debug - Raw secrets type:", type(users_section))
+            st.sidebar.write("Debug - Raw secrets:", dict(users_section) if users_section else "Empty")
+        return dict(users_section)
+    except Exception as e:
+        if DEBUG_MODE:
+            st.sidebar.error(f"Debug - Error loading secrets: {e}")
         return {}
 
 
@@ -68,26 +73,66 @@ def verify_password(username: str, password: str) -> bool:
     """Verify a password against the stored hash."""
     users = get_users_from_secrets()
     
-    if username not in users:
-        return False
+    if DEBUG_MODE:
+        st.sidebar.write(f"Debug - Looking for user: '{username}'")
+        st.sidebar.write(f"Debug - Available users: {list(users.keys())}")
     
-    stored = users[username]
+    # Try direct match first
+    if username in users:
+        stored = users[username]
+        if DEBUG_MODE:
+            st.sidebar.write(f"Debug - Found direct match")
+    else:
+        # Try to find by email field
+        found_user = None
+        for user_key, user_data in users.items():
+            if isinstance(user_data, dict):
+                if user_data.get("email", "").lower() == username.lower():
+                    found_user = user_data
+                    break
+        
+        if found_user:
+            stored = found_user
+            if DEBUG_MODE:
+                st.sidebar.write(f"Debug - Found by email field")
+        else:
+            if DEBUG_MODE:
+                st.sidebar.write(f"Debug - User not found")
+            return False
     
     # Handle both simple format (just hash) and detailed format (dict with password_hash)
     if isinstance(stored, dict):
         stored_hash = stored.get("password_hash", "")
     else:
-        stored_hash = stored
+        stored_hash = str(stored)
+    
+    if DEBUG_MODE:
+        st.sidebar.write(f"Debug - Stored hash (first 10 chars): {stored_hash[:10]}...")
     
     # Use constant-time comparison to prevent timing attacks
     password_hash = hash_password(password)
+    
+    if DEBUG_MODE:
+        st.sidebar.write(f"Debug - Input hash (first 10 chars): {password_hash[:10]}...")
+        st.sidebar.write(f"Debug - Hashes match: {password_hash == stored_hash}")
+    
     return hmac.compare_digest(password_hash, stored_hash)
 
 
 def get_user_info(username: str) -> dict:
     """Get additional info about a user if available."""
     users = get_users_from_secrets()
+    
+    # Try direct match
     stored = users.get(username, {})
+    
+    # If not found, try by email
+    if not stored:
+        for user_key, user_data in users.items():
+            if isinstance(user_data, dict):
+                if user_data.get("email", "").lower() == username.lower():
+                    stored = user_data
+                    break
     
     if isinstance(stored, dict):
         return {
@@ -183,17 +228,18 @@ def render_landing_page():
     with col2:
         st.markdown("### 🔐 Customer Login")
         
-        with st.form("login_form"):
-            username = st.text_input("Email")
-            password = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Log In", use_container_width=True)
-            
-            if submitted:
-                if login(username, password):
-                    st.success("✅ Logged in!")
-                    st.rerun()
-                else:
-                    st.error("Invalid email or password")
+        # Use regular inputs instead of form to debug
+        username = st.text_input("Email", key="login_email")
+        password = st.text_input("Password", type="password", key="login_password")
+        
+        if st.button("Log In", use_container_width=True, type="primary"):
+            if not username or not password:
+                st.error("Please enter both email and password")
+            elif login(username, password):
+                st.success("✅ Logged in!")
+                st.rerun()
+            else:
+                st.error("Invalid email or password")
         
         st.markdown("---")
         
@@ -312,7 +358,7 @@ def main():
         page_title=APP_NAME,
         page_icon="📈",
         layout="wide",
-        initial_sidebar_state="collapsed"
+        initial_sidebar_state="expanded" if DEBUG_MODE else "collapsed"
     )
     
     # Initialize session state
@@ -322,6 +368,11 @@ def main():
     if st.session_state.authenticated and check_session_timeout():
         logout()
         st.warning("Your session has expired. Please log in again.")
+    
+    # Debug sidebar
+    if DEBUG_MODE:
+        st.sidebar.title("🔧 Debug Info")
+        st.sidebar.write("Session state:", dict(st.session_state))
     
     # Route to appropriate view
     if st.session_state.authenticated:
