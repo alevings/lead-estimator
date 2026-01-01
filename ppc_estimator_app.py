@@ -384,59 +384,134 @@ def build_ramp_table(
 MONTH_RE = re.compile(r"^(?:Searches:\s*)?(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}$", re.IGNORECASE)
 
 
-def load_keyword_planner_xlsx(uploaded_file) -> Tuple[pd.DataFrame, int, List[str]]:
+def load_keyword_planner_file(uploaded_file) -> Tuple[pd.DataFrame, int, List[str]]:
     """
-    Load and parse a Google Keyword Planner XLSX export.
+    Load and parse a Google Keyword Planner export.
+    
+    Supports:
+    - XLSX files (with or without title rows)
+    - CSV files (UTF-8, UTF-16, with comma or tab separators)
     
     Returns:
         - DataFrame with keyword data
         - Total average monthly searches
         - List of detected month columns (for seasonality)
     """
-    xl = pd.ExcelFile(uploaded_file)
-    sheet = xl.sheet_names[0]
-    raw = xl.parse(sheet)
-
-    # Find header row
-    header_row_idx = None
-    for i in range(min(20, len(raw))):
-        row = raw.iloc[i].astype(str).tolist()
-        if "Keyword" in row and "Avg. monthly searches" in row:
-            header_row_idx = i
-            break
-    if header_row_idx is None:
-        raise ValueError("Header row not found. Export must include 'Keyword' and 'Avg. monthly searches'.")
-
-    headers = raw.iloc[header_row_idx].tolist()
-    df = raw.iloc[header_row_idx + 1:].copy()
-    df.columns = headers
-    df = df.reset_index(drop=True)
-
+    filename = uploaded_file.name.lower()
+    
+    # Determine file type and load accordingly
+    if filename.endswith('.xlsx') or filename.endswith('.xls'):
+        df = _load_keyword_planner_excel(uploaded_file)
+    elif filename.endswith('.csv') or filename.endswith('.tsv'):
+        df = _load_keyword_planner_csv(uploaded_file)
+    else:
+        raise ValueError(f"Unsupported file type: {filename}. Please upload .xlsx, .xls, .csv, or .tsv")
+    
+    # Validate required columns
+    if "Keyword" not in df.columns:
+        raise ValueError("Missing 'Keyword' column. Is this a Keyword Planner export?")
     if "Avg. monthly searches" not in df.columns:
-        raise ValueError("Missing 'Avg. monthly searches' column.")
-
+        raise ValueError("Missing 'Avg. monthly searches' column. Is this a Keyword Planner export?")
+    
+    # Convert search volume to numeric
     df["Avg. monthly searches"] = pd.to_numeric(df["Avg. monthly searches"], errors="coerce")
-
+    
     # Detect month columns for seasonality
     month_cols = [
         c for c in df.columns
         if isinstance(c, str) and MONTH_RE.match(c.strip())
     ]
-
+    
     for c in month_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-
+    
     total_avg = int(df["Avg. monthly searches"].fillna(0).sum())
-
+    
     def month_sort_key(col: str) -> Tuple[int, int]:
         col = col.strip().replace("Searches:", "").strip()
         m, y = col.split()
         m_map = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
                  "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
         return (int(y), m_map[m.lower()])
-
+    
     month_cols = sorted(month_cols, key=month_sort_key) if month_cols else []
     return df, total_avg, month_cols
+
+
+def _load_keyword_planner_excel(uploaded_file) -> pd.DataFrame:
+    """Load Keyword Planner from Excel file."""
+    xl = pd.ExcelFile(uploaded_file)
+    sheet = xl.sheet_names[0]
+    raw = xl.parse(sheet)
+    
+    # Check if headers are already in the column names
+    col_names = [str(c) for c in raw.columns]
+    if "Keyword" in col_names and "Avg. monthly searches" in col_names:
+        return raw.copy()
+    
+    # Look for header row in the data
+    header_row_idx = None
+    for i in range(min(20, len(raw))):
+        row = raw.iloc[i].astype(str).tolist()
+        if "Keyword" in row and "Avg. monthly searches" in row:
+            header_row_idx = i
+            break
+    
+    if header_row_idx is None:
+        raise ValueError("Could not find header row with 'Keyword' and 'Avg. monthly searches'.")
+    
+    headers = raw.iloc[header_row_idx].tolist()
+    df = raw.iloc[header_row_idx + 1:].copy()
+    df.columns = headers
+    df = df.reset_index(drop=True)
+    return df
+
+
+def _load_keyword_planner_csv(uploaded_file) -> pd.DataFrame:
+    """Load Keyword Planner from CSV file, handling various encodings and formats."""
+    
+    # Read file content to detect encoding and format
+    content = uploaded_file.read()
+    uploaded_file.seek(0)  # Reset for re-reading
+    
+    # Try different encodings
+    encodings_to_try = ['utf-8', 'utf-16', 'utf-16-le', 'latin-1', 'cp1252']
+    
+    for encoding in encodings_to_try:
+        try:
+            decoded = content.decode(encoding)
+            break
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    else:
+        raise ValueError("Could not decode file. Please try saving as UTF-8 CSV.")
+    
+    # Detect separator (tab vs comma)
+    first_lines = decoded.split('\n')[:5]
+    tab_count = sum(line.count('\t') for line in first_lines)
+    comma_count = sum(line.count(',') for line in first_lines)
+    separator = '\t' if tab_count > comma_count else ','
+    
+    # Find the header row (may have title rows before it)
+    header_row = None
+    for i, line in enumerate(first_lines):
+        if 'Keyword' in line and 'Avg. monthly searches' in line:
+            header_row = i
+            break
+    
+    if header_row is None:
+        raise ValueError("Could not find header row with 'Keyword' and 'Avg. monthly searches'.")
+    
+    # Read with detected settings
+    uploaded_file.seek(0)
+    df = pd.read_csv(
+        uploaded_file,
+        encoding=encoding,
+        sep=separator,
+        skiprows=header_row
+    )
+    
+    return df
 
 
 def sum_month_searches(df: pd.DataFrame, month_col: str) -> float:
@@ -600,13 +675,13 @@ st.subheader("📁 Data Sources")
 upload_col1, upload_col2 = st.columns(2, gap="large")
 
 with upload_col1:
-    st.markdown("#### Keyword Planner (XLSX)")
+    st.markdown("#### Keyword Planner")
     st.caption("Required for PPC and Maps. Optional for Organic if you have GSC.")
     uploaded_kw = st.file_uploader(
-        "Upload Keyword Planner XLSX",
-        type=["xlsx"],
+        "Upload Keyword Planner export",
+        type=["xlsx", "xls", "csv", "tsv"],
         key="kw_uploader",
-        help="Export from Google Keyword Planner with 'Avg. monthly searches' column"
+        help="Export from Google Keyword Planner (.xlsx, .csv, or .tsv)"
     )
 
     df_kw = None
@@ -615,7 +690,7 @@ with upload_col1:
 
     if uploaded_kw:
         try:
-            df_kw, total_avg_searches, month_cols = load_keyword_planner_xlsx(uploaded_kw)
+            df_kw, total_avg_searches, month_cols = load_keyword_planner_file(uploaded_kw)
             st.success(f"✅ Loaded: {len(df_kw):,} keywords | **{total_avg_searches:,}** avg monthly searches")
             if month_cols:
                 st.caption(f"Seasonality columns detected: {len(month_cols)} months")
@@ -626,13 +701,13 @@ with upload_col1:
             df_kw = None
 
 with upload_col2:
-    st.markdown("#### Google Search Console (CSV)")
+    st.markdown("#### Google Search Console")
     st.caption("Optional. Provides site-specific baseline for Organic estimates.")
     gsc_csv = st.file_uploader(
-        "Upload GSC Queries CSV",
-        type=["csv"],
+        "Upload GSC Queries export",
+        type=["csv", "tsv"],
         key="gsc_uploader",
-        help="Export the 'Queries' report from Google Search Console"
+        help="Export the 'Queries' report from Google Search Console (.csv)"
     )
 
     gsc_df = None
