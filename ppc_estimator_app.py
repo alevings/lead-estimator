@@ -13,11 +13,14 @@ Key changes in this version:
 - Added assumptions export functionality
 - Collapsible advanced inputs to reduce overwhelm
 - Constants for magic strings
+- Multi-format file support (CSV, XLSX, TSV with auto-encoding detection)
+- Clean CSV exports with descriptive filenames
 """
 
 import math
 import re
 import json
+import io
 from datetime import datetime
 from typing import List, Tuple, Optional, Dict
 
@@ -102,6 +105,39 @@ def safe_div(a: float, b: float) -> float:
 def pct_to_dec(pct_value: float) -> float:
     """Convert human percentage (35) to decimal (0.35)"""
     return pct_value / 100.0
+
+
+def df_to_clean_csv(df: pd.DataFrame) -> str:
+    """
+    Convert DataFrame to clean CSV string without BOM or index.
+    Uses regular hyphens instead of en-dashes for compatibility.
+    """
+    # Replace en-dashes with regular hyphens for compatibility
+    df_clean = df.copy()
+    for col in df_clean.columns:
+        if df_clean[col].dtype == object:
+            df_clean[col] = df_clean[col].str.replace('–', '-', regex=False)
+    
+    return df_clean.to_csv(index=False)
+
+
+def download_table_button(
+    df: pd.DataFrame,
+    filename: str,
+    button_label: str = "📥 Download CSV",
+    key: str = None
+):
+    """
+    Render a download button for a DataFrame with clean CSV export.
+    """
+    csv_data = df_to_clean_csv(df)
+    st.download_button(
+        label=button_label,
+        data=csv_data,
+        file_name=filename,
+        mime="text/csv",
+        key=key
+    )
 
 
 # =========================================================
@@ -1078,7 +1114,7 @@ with tab_ppc:
 
                 return pd.DataFrame(rows), (cap_low, cap_high)
 
-            def render_ppc(total_searches: float, label: str):
+            def render_ppc(total_searches: float, label: str, period_key: str = "avg"):
                 """Render PPC estimates for a given search volume"""
                 st.markdown(f"### {label}")
                 con_df, con_caps = build_ppc_table(total_searches, "conservative")
@@ -1093,10 +1129,22 @@ with tab_ppc:
                 a, b = st.columns(2, gap="large")
                 with a:
                     st.markdown("#### 🐢 Conservative Bidding")
-                    st.dataframe(con_df, use_container_width=True)
+                    st.dataframe(con_df, use_container_width=True, hide_index=True)
+                    download_table_button(
+                        con_df,
+                        f"ppc_conservative_{period_key}_{datetime.now().strftime('%Y%m%d')}.csv",
+                        "📥 Download Conservative",
+                        key=f"dl_ppc_con_{period_key}"
+                    )
                 with b:
                     st.markdown("#### 🚀 Aggressive Bidding")
-                    st.dataframe(agg_df, use_container_width=True)
+                    st.dataframe(agg_df, use_container_width=True, hide_index=True)
+                    download_table_button(
+                        agg_df,
+                        f"ppc_aggressive_{period_key}_{datetime.now().strftime('%Y%m%d')}.csv",
+                        "📥 Download Aggressive",
+                        key=f"dl_ppc_agg_{period_key}"
+                    )
 
             # Render for selected months or average
             if seasonality_mode and selected_months:
@@ -1104,9 +1152,10 @@ with tab_ppc:
                 for t, month in zip(month_tabs, selected_months):
                     with t:
                         total = sum_month_searches(df_kw, month)
-                        render_ppc(total, f"{month} (searches: {total:,.0f})")
+                        month_key = month.replace(" ", "_").replace(":", "")
+                        render_ppc(total, f"{month} (searches: {total:,.0f})", month_key)
             else:
-                render_ppc(float(total_avg_searches), f"Average month (searches: {total_avg_searches:,.0f})")
+                render_ppc(float(total_avg_searches), f"Average month (searches: {total_avg_searches:,.0f})", "avg_month")
 
             # Assumptions expander
             with st.expander("🧠 Assumptions used (PPC)"):
@@ -1354,7 +1403,7 @@ with tab_org:
                 ("Month 6+", ramp_m6),
             ]
 
-            def render_organic_for_search_total(label: str, kw_total_searches: Optional[float]):
+            def render_organic_for_search_total(label: str, kw_total_searches: Optional[float], period_key: str = "avg"):
                 """Render organic estimates for a given context"""
                 st.markdown(f"### {label}")
 
@@ -1390,13 +1439,25 @@ with tab_org:
                     (Scenario.AGGRESSIVE, agg_clicks),
                 ]
                 steady_df = build_scenario_table(scenarios, cvr, "Clicks/mo", "Leads/mo")
-                st.dataframe(steady_df, use_container_width=True)
+                st.dataframe(steady_df, use_container_width=True, hide_index=True)
                 st.caption(base_note)
+                download_table_button(
+                    steady_df,
+                    f"organic_scenarios_{period_key}_{datetime.now().strftime('%Y%m%d')}.csv",
+                    "📥 Download Scenarios",
+                    key=f"dl_org_scenarios_{period_key}"
+                )
 
                 # Ramp table
                 st.markdown("#### Time Ramp (leads over time)")
                 ramp_df = build_ramp_table(scenarios, cvr, org_ramps)
-                st.dataframe(ramp_df, use_container_width=True)
+                st.dataframe(ramp_df, use_container_width=True, hide_index=True)
+                download_table_button(
+                    ramp_df,
+                    f"organic_ramp_{period_key}_{datetime.now().strftime('%Y%m%d')}.csv",
+                    "📥 Download Ramp",
+                    key=f"dl_org_ramp_{period_key}"
+                )
 
                 # BOTH mode: net-new expansion
                 if org_mode == DataMode.BOTH and kw_total_searches is not None:
@@ -1411,16 +1472,23 @@ with tab_org:
                         kw_expected_clicks[1] * net_new_factor
                     )
 
-                    st.dataframe(pd.DataFrame([
+                    net_new_df = pd.DataFrame([
                         {
-                            "Metric": "Net-new clicks/mo (low–high)",
-                            "Value": f"{num(net_new_clicks[0], 0)}–{num(net_new_clicks[1], 0)}",
+                            "Metric": "Net-new clicks/mo (low-high)",
+                            "Value": f"{num(net_new_clicks[0], 0)}-{num(net_new_clicks[1], 0)}",
                         },
                         {
-                            "Metric": "Net-new leads/mo (low–high)",
-                            "Value": f"{num(net_new_clicks[0] * cvr, 1)}–{num(net_new_clicks[1] * cvr, 1)}",
+                            "Metric": "Net-new leads/mo (low-high)",
+                            "Value": f"{num(net_new_clicks[0] * cvr, 1)}-{num(net_new_clicks[1] * cvr, 1)}",
                         }
-                    ]), use_container_width=True)
+                    ])
+                    st.dataframe(net_new_df, use_container_width=True, hide_index=True)
+                    download_table_button(
+                        net_new_df,
+                        f"organic_expansion_{period_key}_{datetime.now().strftime('%Y%m%d')}.csv",
+                        "📥 Download Expansion",
+                        key=f"dl_org_exp_{period_key}"
+                    )
 
             # Render for selected months or average
             if has_kw and seasonality_mode and selected_months:
@@ -1428,11 +1496,12 @@ with tab_org:
                 for t, month in zip(month_tabs, selected_months):
                     with t:
                         total = sum_month_searches(df_kw, month)
-                        render_organic_for_search_total(f"{month} (searches: {total:,.0f})", total)
+                        month_key = month.replace(" ", "_").replace(":", "")
+                        render_organic_for_search_total(f"{month} (searches: {total:,.0f})", total, month_key)
             else:
                 kw_total = float(total_avg_searches) if has_kw else None
                 label = f"Average month (searches: {total_avg_searches:,.0f})" if has_kw else "GSC-only (no Keyword Planner ceiling)"
-                render_organic_for_search_total(label, kw_total)
+                render_organic_for_search_total(label, kw_total, "avg_month")
 
             # Assumptions expander
             with st.expander("🧠 Assumptions used (Organic)"):
@@ -1632,7 +1701,7 @@ with tab_maps:
             def actions_to_leads(actions_low_high: Tuple[float, float]) -> Tuple[float, float]:
                 return (actions_low_high[0] * maps_qual, actions_low_high[1] * maps_qual)
 
-            def render_maps(total_searches: float, label: str):
+            def render_maps(total_searches: float, label: str, period_key: str = "avg"):
                 """Render Maps estimates for a given search volume"""
                 st.markdown(f"### {label}")
 
@@ -1644,21 +1713,27 @@ with tab_maps:
                 steady_df = pd.DataFrame([
                     {
                         "Scenario": Scenario.CONSERVATIVE,
-                        "Actions/mo (low–high)": f"{num(con_actions[0], 0)}–{num(con_actions[1], 0)}",
-                        "Qualified leads/mo (low–high)": f"{num(actions_to_leads(con_actions)[0], 1)}–{num(actions_to_leads(con_actions)[1], 1)}"
+                        "Actions/mo (low-high)": f"{num(con_actions[0], 0)}-{num(con_actions[1], 0)}",
+                        "Qualified leads/mo (low-high)": f"{num(actions_to_leads(con_actions)[0], 1)}-{num(actions_to_leads(con_actions)[1], 1)}"
                     },
                     {
                         "Scenario": Scenario.EXPECTED,
-                        "Actions/mo (low–high)": f"{num(exp_actions[0], 0)}–{num(exp_actions[1], 0)}",
-                        "Qualified leads/mo (low–high)": f"{num(actions_to_leads(exp_actions)[0], 1)}–{num(actions_to_leads(exp_actions)[1], 1)}"
+                        "Actions/mo (low-high)": f"{num(exp_actions[0], 0)}-{num(exp_actions[1], 0)}",
+                        "Qualified leads/mo (low-high)": f"{num(actions_to_leads(exp_actions)[0], 1)}-{num(actions_to_leads(exp_actions)[1], 1)}"
                     },
                     {
                         "Scenario": Scenario.AGGRESSIVE,
-                        "Actions/mo (low–high)": f"{num(agg_actions[0], 0)}–{num(agg_actions[1], 0)}",
-                        "Qualified leads/mo (low–high)": f"{num(actions_to_leads(agg_actions)[0], 1)}–{num(actions_to_leads(agg_actions)[1], 1)}"
+                        "Actions/mo (low-high)": f"{num(agg_actions[0], 0)}-{num(agg_actions[1], 0)}",
+                        "Qualified leads/mo (low-high)": f"{num(actions_to_leads(agg_actions)[0], 1)}-{num(actions_to_leads(agg_actions)[1], 1)}"
                     },
                 ])
-                st.dataframe(steady_df, use_container_width=True)
+                st.dataframe(steady_df, use_container_width=True, hide_index=True)
+                download_table_button(
+                    steady_df,
+                    f"maps_scenarios_{period_key}_{datetime.now().strftime('%Y%m%d')}.csv",
+                    "📥 Download Scenarios",
+                    key=f"dl_maps_scenarios_{period_key}"
+                )
 
                 # Ramp table
                 st.markdown("#### Time Ramp (Maps leads over time)")
@@ -1668,9 +1743,16 @@ with tab_maps:
                     row = {"Scenario": name}
                     for month_label, ramp_pct in maps_ramps:
                         ramped = apply_ramp(leads[0], leads[1], ramp_pct)
-                        row[f"{month_label} leads"] = f"{num(ramped[0], 1)}–{num(ramped[1], 1)}"
+                        row[f"{month_label} leads"] = f"{num(ramped[0], 1)}-{num(ramped[1], 1)}"
                     ramp_rows.append(row)
-                st.dataframe(pd.DataFrame(ramp_rows), use_container_width=True)
+                ramp_df = pd.DataFrame(ramp_rows)
+                st.dataframe(ramp_df, use_container_width=True, hide_index=True)
+                download_table_button(
+                    ramp_df,
+                    f"maps_ramp_{period_key}_{datetime.now().strftime('%Y%m%d')}.csv",
+                    "📥 Download Ramp",
+                    key=f"dl_maps_ramp_{period_key}"
+                )
 
             # Render for selected months or average
             if seasonality_mode and selected_months:
@@ -1678,9 +1760,10 @@ with tab_maps:
                 for t, month in zip(month_tabs, selected_months):
                     with t:
                         total = sum_month_searches(df_kw, month)
-                        render_maps(total, f"{month} (searches: {total:,.0f})")
+                        month_key = month.replace(" ", "_").replace(":", "")
+                        render_maps(total, f"{month} (searches: {total:,.0f})", month_key)
             else:
-                render_maps(float(total_avg_searches), f"Average month (searches: {total_avg_searches:,.0f})")
+                render_maps(float(total_avg_searches), f"Average month (searches: {total_avg_searches:,.0f})", "avg_month")
 
             # Assumptions expander
             with st.expander("🧠 Assumptions used (Maps)"):
@@ -1798,8 +1881,8 @@ with tab_summary:
         org_leads_low, org_leads_high = (org_clicks_low * cvr, org_clicks_high * cvr)
         rows.append({
             "Channel": "Organic (Expected)",
-            "Traffic/Actions (low–high)": f"{num(org_clicks_low, 0)}–{num(org_clicks_high, 0)} clicks",
-            "Leads (low–high)": f"{num(org_leads_low, 1)}–{num(org_leads_high, 1)}",
+            "Traffic/Actions (low-high)": f"{num(org_clicks_low, 0)}-{num(org_clicks_high, 0)} clicks",
+            "Leads (low-high)": f"{num(org_leads_low, 1)}-{num(org_leads_high, 1)}",
             "Notes": org_note,
         })
 
@@ -1811,12 +1894,13 @@ with tab_summary:
             maps_leads_low, maps_leads_high = (maps_actions_low * maps_qual, maps_actions_high * maps_qual)
             rows.append({
                 "Channel": "Maps (Expected)",
-                "Traffic/Actions (low–high)": f"{num(maps_actions_low, 0)}–{num(maps_actions_high, 0)} actions",
-                "Leads (low–high)": f"{num(maps_leads_low, 1)}–{num(maps_leads_high, 1)}",
-                "Notes": "Demand × action share × qualification rate.",
+                "Traffic/Actions (low-high)": f"{num(maps_actions_low, 0)}-{num(maps_actions_high, 0)} actions",
+                "Leads (low-high)": f"{num(maps_leads_low, 1)}-{num(maps_leads_high, 1)}",
+                "Notes": "Demand x action share x qualification rate.",
             })
 
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        summary_df = pd.DataFrame(rows)
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
         # Export assumptions button
         st.divider()
@@ -1833,7 +1917,7 @@ with tab_summary:
             "estimates": {
                 row["Channel"]: {
                     "traffic": row["Traffic/Actions (low–high)"],
-                    "leads": row["Leads (low–high)"],
+                    "leads": row["Leads (low-high)"],
                     "notes": row["Notes"],
                 }
                 for row in rows
@@ -1845,17 +1929,16 @@ with tab_summary:
             st.download_button(
                 label="📥 Download Assumptions (JSON)",
                 data=json.dumps(assumptions_export, indent=2),
-                file_name=f"growth_estimate_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                file_name=f"growth_estimate_assumptions_{datetime.now().strftime('%Y%m%d')}.json",
                 mime="application/json",
             )
         with col2:
-            # CSV export of summary table
-            csv_data = pd.DataFrame(rows).to_csv(index=False)
-            st.download_button(
-                label="📥 Download Summary (CSV)",
-                data=csv_data,
-                file_name=f"growth_summary_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv",
+            # CSV export of summary table using clean export
+            download_table_button(
+                summary_df,
+                f"growth_summary_{datetime.now().strftime('%Y%m%d')}.csv",
+                "📥 Download Summary (CSV)",
+                key="dl_summary"
             )
 
         st.info(
