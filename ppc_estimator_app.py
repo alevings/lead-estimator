@@ -457,7 +457,7 @@ def build_ramp_table(
 MONTH_RE = re.compile(r"^(?:Searches:\s*)?(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}$", re.IGNORECASE)
 
 
-def load_keyword_planner_file(uploaded_file) -> Tuple[pd.DataFrame, int, List[str]]:
+def load_keyword_planner_file(uploaded_file) -> Tuple[pd.DataFrame, int, List[str], Optional[Dict[str, float]]]:
     """
     Load and parse a Google Keyword Planner export.
     
@@ -469,6 +469,7 @@ def load_keyword_planner_file(uploaded_file) -> Tuple[pd.DataFrame, int, List[st
         - DataFrame with keyword data
         - Total average monthly searches
         - List of detected month columns (for seasonality)
+        - CPC data dict (if available): {"low": weighted_avg_low, "high": weighted_avg_high}
     """
     filename = uploaded_file.name.lower()
     
@@ -508,7 +509,73 @@ def load_keyword_planner_file(uploaded_file) -> Tuple[pd.DataFrame, int, List[st
         return (int(y), m_map[m.lower()])
     
     month_cols = sorted(month_cols, key=month_sort_key) if month_cols else []
-    return df, total_avg, month_cols
+    
+    # Extract CPC data if available
+    cpc_data = _extract_cpc_data(df)
+    
+    return df, total_avg, month_cols, cpc_data
+
+
+def _extract_cpc_data(df: pd.DataFrame) -> Optional[Dict[str, float]]:
+    """
+    Extract weighted average CPC from Keyword Planner data.
+    
+    Looks for columns like:
+    - "Top of page bid (low range)" / "Top of page bid (high range)"
+    - "Low top of page bid" / "High top of page bid"
+    
+    Returns weighted average by search volume, or None if not available.
+    """
+    # Find CPC columns (various naming conventions)
+    low_cpc_col = None
+    high_cpc_col = None
+    
+    for col in df.columns:
+        col_lower = str(col).lower()
+        if 'top of page bid' in col_lower or 'page bid' in col_lower:
+            if 'low' in col_lower:
+                low_cpc_col = col
+            elif 'high' in col_lower:
+                high_cpc_col = col
+    
+    if low_cpc_col is None or high_cpc_col is None:
+        return None
+    
+    # Convert to numeric
+    df_temp = df.copy()
+    df_temp['_cpc_low'] = pd.to_numeric(df_temp[low_cpc_col], errors='coerce')
+    df_temp['_cpc_high'] = pd.to_numeric(df_temp[high_cpc_col], errors='coerce')
+    df_temp['_searches'] = pd.to_numeric(df_temp['Avg. monthly searches'], errors='coerce').fillna(0)
+    
+    # Filter rows with valid CPC data
+    valid_rows = df_temp[
+        (df_temp['_cpc_low'].notna()) & 
+        (df_temp['_cpc_high'].notna()) & 
+        (df_temp['_searches'] > 0)
+    ]
+    
+    if len(valid_rows) == 0:
+        return None
+    
+    # Calculate weighted averages
+    total_searches = valid_rows['_searches'].sum()
+    if total_searches == 0:
+        return None
+    
+    weighted_low = (valid_rows['_cpc_low'] * valid_rows['_searches']).sum() / total_searches
+    weighted_high = (valid_rows['_cpc_high'] * valid_rows['_searches']).sum() / total_searches
+    
+    # Also get min/max for reference
+    return {
+        "weighted_low": round(weighted_low, 2),
+        "weighted_high": round(weighted_high, 2),
+        "min_low": round(valid_rows['_cpc_low'].min(), 2),
+        "max_low": round(valid_rows['_cpc_low'].max(), 2),
+        "min_high": round(valid_rows['_cpc_high'].min(), 2),
+        "max_high": round(valid_rows['_cpc_high'].max(), 2),
+        "keywords_with_cpc": len(valid_rows),
+        "total_keywords": len(df),
+    }
 
 
 def _load_keyword_planner_excel(uploaded_file) -> pd.DataFrame:
@@ -760,13 +827,19 @@ with upload_col1:
     df_kw = None
     total_avg_searches = None
     month_cols: List[str] = []
+    kw_cpc_data: Optional[Dict[str, float]] = None
 
     if uploaded_kw:
         try:
-            df_kw, total_avg_searches, month_cols = load_keyword_planner_file(uploaded_kw)
+            df_kw, total_avg_searches, month_cols, kw_cpc_data = load_keyword_planner_file(uploaded_kw)
             st.success(f"✅ Loaded: {len(df_kw):,} keywords | **{total_avg_searches:,}** avg monthly searches")
             if month_cols:
                 st.caption(f"Seasonality columns detected: {len(month_cols)} months")
+            if kw_cpc_data:
+                st.info(
+                    f"💰 **CPC data detected:** Weighted avg ${kw_cpc_data['weighted_low']:.2f}–${kw_cpc_data['weighted_high']:.2f} "
+                    f"(from {kw_cpc_data['keywords_with_cpc']}/{kw_cpc_data['total_keywords']} keywords with bid data)"
+                )
             with st.expander("Preview keywords (first 25)"):
                 st.dataframe(df_kw.head(25), use_container_width=True)
         except Exception as e:
@@ -942,6 +1015,42 @@ with tab_ppc:
     else:
         st.caption("PPC output is capped by demand: searches × business-hours × impression share × CTR.")
 
+        # Calculate CPC defaults from uploaded data or use static defaults
+        if kw_cpc_data:
+            # Use weighted averages from Keyword Planner
+            # Conservative: use the low bid range (discounted slightly for conservative bidding)
+            default_con_cpc_low = max(3.0, kw_cpc_data['weighted_low'] * 0.7)  # 70% of weighted low
+            default_con_cpc_high = kw_cpc_data['weighted_low']  # Full weighted low
+            # Aggressive: use the high bid range
+            default_agg_cpc_low = kw_cpc_data['weighted_low']  # Start at weighted low
+            default_agg_cpc_high = kw_cpc_data['weighted_high']  # Up to weighted high
+            
+            # Update recommended ranges based on actual data
+            con_cpc_rec_min = max(1.0, kw_cpc_data['min_low'] * 0.5)
+            con_cpc_rec_max = kw_cpc_data['weighted_low'] * 1.2
+            agg_cpc_rec_min = kw_cpc_data['weighted_low'] * 0.8
+            agg_cpc_rec_max = min(200.0, kw_cpc_data['weighted_high'] * 1.2)
+            
+            st.success(
+                f"💰 **CPC defaults auto-populated from your data:** "
+                f"Conservative ${default_con_cpc_low:.2f}–${default_con_cpc_high:.2f} | "
+                f"Aggressive ${default_agg_cpc_low:.2f}–${default_agg_cpc_high:.2f}"
+            )
+        else:
+            # Static defaults for files without CPC data
+            default_con_cpc_low = 4.0
+            default_con_cpc_high = 6.0
+            default_agg_cpc_low = 7.0
+            default_agg_cpc_high = 10.0
+            con_cpc_rec_min = 3.0
+            con_cpc_rec_max = 7.0
+            agg_cpc_rec_min = 5.0
+            agg_cpc_rec_max = 20.0
+            st.warning(
+                "⚠️ **No CPC data in upload.** Using generic defaults ($4–$10). "
+                "For better estimates, use a Keyword Planner export that includes 'Top of page bid' columns."
+            )
+
         # FIX: Collapsible posture sections to reduce overwhelm
         # FIX: Renamed from "Mid-page" to "Conservative bidding" for clarity
         
@@ -955,9 +1064,9 @@ with tab_ppc:
                 )
                 con_cpc_low = money_input(
                     label="CPC low ($)",
-                    default_value=4.0,
-                    recommended_min=3.0,
-                    recommended_max=7.0,
+                    default_value=default_con_cpc_low,
+                    recommended_min=con_cpc_rec_min,
+                    recommended_max=con_cpc_rec_max,
                     hard_min=0.01,
                     hard_max=500.0,
                     step=0.25,
@@ -967,9 +1076,9 @@ with tab_ppc:
                 )
                 con_cpc_high = money_input(
                     label="CPC high ($)",
-                    default_value=6.0,
-                    recommended_min=4.0,
-                    recommended_max=10.0,
+                    default_value=default_con_cpc_high,
+                    recommended_min=con_cpc_rec_min * 1.2,
+                    recommended_max=con_cpc_rec_max * 1.3,
                     hard_min=0.01,
                     hard_max=500.0,
                     step=0.25,
@@ -1043,9 +1152,9 @@ with tab_ppc:
                 )
                 agg_cpc_low = money_input(
                     label="CPC low ($)",
-                    default_value=7.0,
-                    recommended_min=5.0,
-                    recommended_max=12.0,
+                    default_value=default_agg_cpc_low,
+                    recommended_min=agg_cpc_rec_min,
+                    recommended_max=agg_cpc_rec_max * 0.6,
                     hard_min=0.01,
                     hard_max=500.0,
                     step=0.25,
@@ -1055,9 +1164,9 @@ with tab_ppc:
                 )
                 agg_cpc_high = money_input(
                     label="CPC high ($)",
-                    default_value=10.0,
-                    recommended_min=7.0,
-                    recommended_max=20.0,
+                    default_value=default_agg_cpc_high,
+                    recommended_min=agg_cpc_rec_min * 1.2,
+                    recommended_max=agg_cpc_rec_max,
                     hard_min=0.01,
                     hard_max=500.0,
                     step=0.25,
