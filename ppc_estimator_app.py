@@ -53,6 +53,43 @@ class DataMode:
     NONE = "NONE"
 
 
+class GSCDateRange:
+    """GSC export date range options and their divisors for monthly conversion"""
+    LAST_7_DAYS = "Last 7 days"
+    LAST_28_DAYS = "Last 28 days"
+    LAST_3_MONTHS = "Last 3 months"
+    LAST_6_MONTHS = "Last 6 months"
+    LAST_12_MONTHS = "Last 12 months"
+    LAST_16_MONTHS = "Last 16 months"
+    
+    # Divisors to convert period totals to monthly averages
+    DIVISORS = {
+        LAST_7_DAYS: 7 / 30,      # ~0.23 months
+        LAST_28_DAYS: 28 / 30,    # ~0.93 months  
+        LAST_3_MONTHS: 3,
+        LAST_6_MONTHS: 6,
+        LAST_12_MONTHS: 12,
+        LAST_16_MONTHS: 16,
+    }
+    
+    @classmethod
+    def get_divisor(cls, range_selection: str) -> float:
+        """Get the divisor to convert totals to monthly averages"""
+        return cls.DIVISORS.get(range_selection, 1.0)
+    
+    @classmethod
+    def get_options(cls) -> List[str]:
+        """Get list of date range options"""
+        return [
+            cls.LAST_7_DAYS,
+            cls.LAST_28_DAYS,
+            cls.LAST_3_MONTHS,
+            cls.LAST_6_MONTHS,
+            cls.LAST_12_MONTHS,
+            cls.LAST_16_MONTHS,
+        ]
+
+
 # =========================================================
 # Formatting + parsing helpers
 # =========================================================
@@ -752,20 +789,44 @@ with upload_col2:
     if gsc_csv:
         try:
             gsc_df = load_gsc_queries_csv(gsc_csv)
-            total_impr = gsc_df["impressions"].sum()
-            total_clicks = gsc_df["clicks"].sum()
+            
+            # GSC Date Range selector - CRITICAL for correct monthly estimates
+            st.markdown("##### 📅 What date range does this export cover?")
+            gsc_date_range = st.selectbox(
+                "GSC Export Date Range",
+                options=GSCDateRange.get_options(),
+                index=4,  # Default to "Last 12 months" since that's common
+                key="gsc_date_range",
+                help="GSC exports show cumulative totals for the selected period. We'll divide by the appropriate number to get monthly averages."
+            )
+            gsc_period_divisor = GSCDateRange.get_divisor(gsc_date_range)
+            
+            # Calculate raw totals from file
+            raw_total_impr = gsc_df["impressions"].sum()
+            raw_total_clicks = gsc_df["clicks"].sum()
+            
+            # Convert to monthly averages
+            monthly_impr = raw_total_impr / gsc_period_divisor
+            monthly_clicks = raw_total_clicks / gsc_period_divisor
+            
             gsc_summary = {
                 "queries": float(gsc_df["query"].nunique()),
-                "impressions": float(total_impr),
-                "clicks": float(total_clicks),
-                "ctr": float(total_clicks / total_impr) if total_impr > 0 else 0.0,
+                "impressions": float(monthly_impr),  # Now monthly average
+                "clicks": float(monthly_clicks),      # Now monthly average
+                "ctr": float(raw_total_clicks / raw_total_impr) if raw_total_impr > 0 else 0.0,
                 "avg_position": float(gsc_df["position"].mean()) if "position" in gsc_df.columns else math.nan,
+                "raw_impressions": float(raw_total_impr),  # Keep raw for reference
+                "raw_clicks": float(raw_total_clicks),
+                "date_range": gsc_date_range,
+                "period_divisor": gsc_period_divisor,
             }
             st.success(
                 f"✅ Loaded: {int(gsc_summary['queries']):,} queries | "
-                f"{int(gsc_summary['impressions']):,} impressions | "
+                f"**{int(monthly_impr):,} impressions/mo** | "
+                f"**{int(monthly_clicks):,} clicks/mo** | "
                 f"CTR ~ {pct_str(gsc_summary['ctr'], 1)}"
             )
+            st.caption(f"📊 Raw totals ({gsc_date_range}): {int(raw_total_impr):,} impressions, {int(raw_total_clicks):,} clicks → divided by {gsc_period_divisor:.2f} for monthly avg")
             with st.expander("Preview GSC data (top 25 by impressions)"):
                 st.dataframe(
                     gsc_df.sort_values("impressions", ascending=False).head(25),
@@ -1411,15 +1472,17 @@ with tab_org:
                 if has_gsc:
                     gsc_impr = float(gsc_summary["impressions"])
                     gsc_clicks = float(gsc_summary["clicks"])
+                    date_range = gsc_summary.get("date_range", "Unknown")
                     st.info(
-                        f"**GSC baseline:** {int(gsc_impr):,} impressions | "
-                        f"{int(gsc_clicks):,} clicks | CTR ~ {pct_str(gsc_summary['ctr'], 1)}"
+                        f"**GSC baseline (monthly avg):** {int(gsc_impr):,} impressions/mo | "
+                        f"{int(gsc_clicks):,} clicks/mo | CTR ~ {pct_str(gsc_summary['ctr'], 1)}\n\n"
+                        f"_Source: {date_range} export, converted to monthly average_"
                     )
 
                     con_clicks = organic_clicks_from_gsc(gsc_impr, org_con_low, org_con_high)
                     exp_clicks = organic_clicks_from_gsc(gsc_impr, org_exp_low, org_exp_high)
                     agg_clicks = organic_clicks_from_gsc(gsc_impr, org_agg_low, org_agg_high)
-                    base_note = "GSC-based (site-specific): clicks = impressions × scenario CTR."
+                    base_note = "GSC-based (site-specific): clicks = monthly impressions × scenario CTR."
                 else:
                     con_clicks = organic_clicks_from_keyword_demand(
                         kw_total_searches, business_hours_factor, org_con_low, org_con_high, serp_leakage
@@ -1859,8 +1922,8 @@ with tab_summary:
 
             rows.append({
                 "Channel": "PPC (Aggressive ceiling)",
-                "Traffic/Actions (low–high)": f"{num(ppc_agg_cap_low, 0)}–{num(ppc_agg_cap_high, 0)} clicks",
-                "Leads (low–high)": f"{num(ppc_leads_cap[0], 1)}–{num(ppc_leads_cap[1], 1)}",
+                "Traffic/Actions (low-high)": f"{num(ppc_agg_cap_low, 0)}-{num(ppc_agg_cap_high, 0)} clicks",
+                "Leads (low-high)": f"{num(ppc_leads_cap[0], 1)}-{num(ppc_leads_cap[1], 1)}",
                 "Notes": ppc_note,
             })
 
@@ -1916,7 +1979,7 @@ with tab_summary:
             },
             "estimates": {
                 row["Channel"]: {
-                    "traffic": row["Traffic/Actions (low–high)"],
+                    "traffic": row["Traffic/Actions (low-high)"],
                     "leads": row["Leads (low-high)"],
                     "notes": row["Notes"],
                 }
