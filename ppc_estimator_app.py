@@ -575,6 +575,82 @@ def _extract_cpc_data(df: pd.DataFrame) -> Optional[Dict[str, float]]:
         "max_high": round(valid_rows['_cpc_high'].max(), 2),
         "keywords_with_cpc": len(valid_rows),
         "total_keywords": len(df),
+        # Store column names for later filtering
+        "low_cpc_col": low_cpc_col,
+        "high_cpc_col": high_cpc_col,
+    }
+
+
+def calculate_cpc_with_cap(df: pd.DataFrame, cpc_data: Dict, max_cpc: float) -> Dict[str, float]:
+    """
+    Recalculate weighted CPC averages after applying a max CPC cap.
+    
+    Filters out keywords where the LOW bid exceeds the cap (i.e., keywords
+    you wouldn't bid on at all).
+    
+    Returns updated CPC stats dict.
+    """
+    if cpc_data is None:
+        return None
+    
+    low_cpc_col = cpc_data.get("low_cpc_col")
+    high_cpc_col = cpc_data.get("high_cpc_col")
+    
+    if low_cpc_col is None or high_cpc_col is None:
+        return cpc_data
+    
+    # Convert to numeric
+    df_temp = df.copy()
+    df_temp['_cpc_low'] = pd.to_numeric(df_temp[low_cpc_col], errors='coerce')
+    df_temp['_cpc_high'] = pd.to_numeric(df_temp[high_cpc_col], errors='coerce')
+    df_temp['_searches'] = pd.to_numeric(df_temp['Avg. monthly searches'], errors='coerce').fillna(0)
+    
+    # Filter: valid CPC data AND low bid is under the cap
+    # (If the LOW bid is above cap, you wouldn't bid on this keyword at all)
+    valid_rows = df_temp[
+        (df_temp['_cpc_low'].notna()) & 
+        (df_temp['_cpc_high'].notna()) & 
+        (df_temp['_searches'] > 0) &
+        (df_temp['_cpc_low'] <= max_cpc)
+    ]
+    
+    if len(valid_rows) == 0:
+        return {
+            "weighted_low": 0,
+            "weighted_high": 0,
+            "min_low": 0,
+            "max_low": 0,
+            "min_high": 0,
+            "max_high": 0,
+            "keywords_with_cpc": 0,
+            "keywords_under_cap": 0,
+            "total_keywords": len(df),
+            "searches_under_cap": 0,
+            "total_searches_with_cpc": cpc_data.get("keywords_with_cpc", 0),
+        }
+    
+    # Calculate weighted averages with capped high values
+    total_searches = valid_rows['_searches'].sum()
+    
+    # Cap the high CPC values at the max
+    capped_high = valid_rows['_cpc_high'].clip(upper=max_cpc)
+    
+    weighted_low = (valid_rows['_cpc_low'] * valid_rows['_searches']).sum() / total_searches
+    weighted_high = (capped_high * valid_rows['_searches']).sum() / total_searches
+    
+    return {
+        "weighted_low": round(weighted_low, 2),
+        "weighted_high": round(weighted_high, 2),
+        "min_low": round(valid_rows['_cpc_low'].min(), 2),
+        "max_low": round(valid_rows['_cpc_low'].max(), 2),
+        "min_high": round(capped_high.min(), 2),
+        "max_high": round(capped_high.max(), 2),
+        "keywords_with_cpc": cpc_data.get("keywords_with_cpc", 0),
+        "keywords_under_cap": len(valid_rows),
+        "total_keywords": len(df),
+        "searches_under_cap": int(total_searches),
+        "original_weighted_low": cpc_data.get("weighted_low", 0),
+        "original_weighted_high": cpc_data.get("weighted_high", 0),
     }
 
 
@@ -1015,25 +1091,73 @@ with tab_ppc:
     else:
         st.caption("PPC output is capped by demand: searches × business-hours × impression share × CTR.")
 
-        # Calculate CPC defaults from uploaded data or use static defaults
+        # CPC Cap feature - filter out keywords you wouldn't bid on
+        active_cpc_data = kw_cpc_data  # Start with raw data
+        
         if kw_cpc_data:
+            st.markdown("#### 💰 CPC Settings")
+            
+            # Show original data stats
+            st.info(
+                f"**Your data:** {kw_cpc_data['keywords_with_cpc']} keywords with bid data | "
+                f"Weighted avg CPC: ${kw_cpc_data['weighted_low']:.2f}–${kw_cpc_data['weighted_high']:.2f} | "
+                f"Range: ${kw_cpc_data['min_low']:.2f}–${kw_cpc_data['max_high']:.2f}"
+            )
+            
+            # CPC Cap input
+            use_cpc_cap = st.checkbox(
+                "🎯 Set a max CPC cap (exclude expensive keywords)",
+                value=False,
+                key="use_cpc_cap",
+                help="Filter out keywords where even the LOW bid exceeds your max. Useful for excluding unrealistically expensive terms."
+            )
+            
+            if use_cpc_cap:
+                # Suggest a reasonable default cap (75th percentile-ish)
+                suggested_cap = min(50.0, kw_cpc_data['weighted_high'] * 0.6)
+                
+                max_cpc_cap = st.number_input(
+                    "Max CPC you'd pay ($)",
+                    min_value=1.0,
+                    max_value=500.0,
+                    value=suggested_cap,
+                    step=5.0,
+                    key="max_cpc_cap",
+                    help="Keywords with a LOW bid above this will be excluded from estimates."
+                )
+                
+                # Recalculate with cap
+                active_cpc_data = calculate_cpc_with_cap(df_kw, kw_cpc_data, max_cpc_cap)
+                
+                if active_cpc_data and active_cpc_data.get('keywords_under_cap', 0) > 0:
+                    pct_keywords = (active_cpc_data['keywords_under_cap'] / kw_cpc_data['keywords_with_cpc']) * 100
+                    st.success(
+                        f"✅ **After ${max_cpc_cap:.0f} cap:** {active_cpc_data['keywords_under_cap']}/{kw_cpc_data['keywords_with_cpc']} keywords ({pct_keywords:.0f}%) | "
+                        f"~{active_cpc_data['searches_under_cap']:,} searches/mo | "
+                        f"Weighted avg: ${active_cpc_data['weighted_low']:.2f}–${active_cpc_data['weighted_high']:.2f}"
+                    )
+                else:
+                    st.error(f"⚠️ No keywords under ${max_cpc_cap:.0f} cap. Increase the cap or check your data.")
+                    active_cpc_data = kw_cpc_data  # Fall back to original
+
+        # Calculate CPC defaults from (potentially capped) data
+        if active_cpc_data and active_cpc_data.get('weighted_low', 0) > 0:
             # Use weighted averages from Keyword Planner
             # Conservative: use the low bid range (discounted slightly for conservative bidding)
-            default_con_cpc_low = max(3.0, kw_cpc_data['weighted_low'] * 0.7)  # 70% of weighted low
-            default_con_cpc_high = kw_cpc_data['weighted_low']  # Full weighted low
+            default_con_cpc_low = max(3.0, active_cpc_data['weighted_low'] * 0.7)  # 70% of weighted low
+            default_con_cpc_high = active_cpc_data['weighted_low']  # Full weighted low
             # Aggressive: use the high bid range
-            default_agg_cpc_low = kw_cpc_data['weighted_low']  # Start at weighted low
-            default_agg_cpc_high = kw_cpc_data['weighted_high']  # Up to weighted high
+            default_agg_cpc_low = active_cpc_data['weighted_low']  # Start at weighted low
+            default_agg_cpc_high = active_cpc_data['weighted_high']  # Up to weighted high
             
             # Update recommended ranges based on actual data
-            con_cpc_rec_min = max(1.0, kw_cpc_data['min_low'] * 0.5)
-            con_cpc_rec_max = kw_cpc_data['weighted_low'] * 1.2
-            agg_cpc_rec_min = kw_cpc_data['weighted_low'] * 0.8
-            agg_cpc_rec_max = min(200.0, kw_cpc_data['weighted_high'] * 1.2)
+            con_cpc_rec_min = max(1.0, active_cpc_data.get('min_low', 3.0) * 0.5)
+            con_cpc_rec_max = active_cpc_data['weighted_low'] * 1.2
+            agg_cpc_rec_min = active_cpc_data['weighted_low'] * 0.8
+            agg_cpc_rec_max = min(200.0, active_cpc_data['weighted_high'] * 1.2)
             
-            st.success(
-                f"💰 **CPC defaults auto-populated from your data:** "
-                f"Conservative ${default_con_cpc_low:.2f}–${default_con_cpc_high:.2f} | "
+            st.markdown(
+                f"**CPC defaults:** Conservative ${default_con_cpc_low:.2f}–${default_con_cpc_high:.2f} | "
                 f"Aggressive ${default_agg_cpc_low:.2f}–${default_agg_cpc_high:.2f}"
             )
         else:
@@ -1046,11 +1170,14 @@ with tab_ppc:
             con_cpc_rec_max = 7.0
             agg_cpc_rec_min = 5.0
             agg_cpc_rec_max = 20.0
-            st.warning(
-                "⚠️ **No CPC data in upload.** Using generic defaults ($4–$10). "
-                "For better estimates, use a Keyword Planner export that includes 'Top of page bid' columns."
-            )
+            if not kw_cpc_data:
+                st.warning(
+                    "⚠️ **No CPC data in upload.** Using generic defaults ($4–$10). "
+                    "For better estimates, use a Keyword Planner export that includes 'Top of page bid' columns."
+                )
 
+        st.divider()
+        
         # FIX: Collapsible posture sections to reduce overwhelm
         # FIX: Renamed from "Mid-page" to "Conservative bidding" for clarity
         
